@@ -1,0 +1,17 @@
+# Ignore photos and image datasets
+photos/
+
+# Ignore Python virtual environment
+venv/
+.venv/
+
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+
+# Ignore environment variables and API keys
+.env
+.env.*
+
+# Ignore macOS files
+.DS_Store

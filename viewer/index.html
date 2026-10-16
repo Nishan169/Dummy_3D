@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scene reconstruction</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&display=swap">
+<style>
+  :root { --ink:#1c2430; --paper:#eef0f2; --line:#c5cbd2; --perp:#e8a33d; --victim:#4fa3d9; --flag:#ff4d6d; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:#1c2430; font-family:"IBM Plex Sans",system-ui,sans-serif; color:var(--ink); }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  #hud { position:fixed; left:0; right:0; bottom:0; padding:12px 16px calc(12px + env(safe-area-inset-bottom)); background:var(--paper); border-top:1px solid var(--line); }
+  #cap { font-size:15px; font-weight:600; min-height:22px; margin-bottom:8px; }
+  #row { display:flex; gap:10px; align-items:center; }
+  button, select { font:inherit; font-size:14px; padding:6px 12px; border:1px solid var(--ink); background:#fff; color:var(--ink); border-radius:3px; cursor:pointer; }
+  button:hover { background:var(--ink); color:#fff; }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline:3px solid var(--victim); outline-offset:2px; }
+  input[type=range] { flex:1; accent-color:var(--ink); }
+  .chk { font-size:14px; display:flex; gap:6px; align-items:center; white-space:nowrap; }
+  #time { font-variant-numeric:tabular-nums; font-size:13px; min-width:84px; text-align:right; }
+  #key { position:fixed; top:12px; left:12px; background:var(--paper); border:1px solid var(--line); padding:8px 12px; font-size:13px; line-height:1.7; border-radius:3px; }
+  #key i { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; }
+  #err { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background:var(--paper); padding:16px 20px; border-radius:3px; display:none; max-width:420px; }
+  @media (max-width:560px){ #row{flex-wrap:wrap} input[type=range]{flex-basis:100%;order:5} }
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="key"><div><i style="background:var(--perp)"></i>Perpetrator</div><div><i style="background:var(--victim)"></i>Victim</div><div><i style="background:var(--flag)"></i>Point of impact</div></div>
+<div id="err"></div>
+<div id="hud">
+  <div id="cap">&nbsp;</div>
+  <div id="row">
+    <button id="play">Play</button>
+    <button id="restart">Restart</button>
+    <input id="scrub" type="range" min="0" max="1000" value="0" aria-label="Timeline">
+    <span id="time">0.0 / 0.0 s</span>
+    <select id="speed" aria-label="Speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select>
+    <label class="chk"><input type="checkbox" id="paths" checked> Routes</label>
+    <select id="surf" aria-label="Surface"><option value="mesh">Mesh</option><option value="points">Points</option></select>
+    <select id="view" aria-label="Camera"><option value="photo">Photo view</option><option value="orbit">Orbit</option><option value="top">Top-down</option><option value="follow">Follow</option></select>
+    <button id="rec">Save video</button>
+  </div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = id => document.getElementById(id);
+const lerp = (a, b, u) => a + (b - a) * u, clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const kf = (u, k) => { if (u <= k[0][0]) return k[0][1];
+  for (let i = 1; i < k.length; i++) if (u <= k[i][0]) { const [u0, a] = k[i-1], [u1, b] = k[i]; return lerp(a, b, (u - u0) / (u1 - u0)); }
+  return k[k.length-1][1]; };
+
+const renderer = new THREE.WebGLRenderer({ canvas: $('c'), antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x1c2430);
+const camera = new THREE.PerspectiveCamera(55, 1, 0.05, 200);
+const controls = new OrbitControls(camera, renderer.domElement); controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.3); sun.position.set(3, 6, 2); scene.add(sun);
+function resize() { const h = innerHeight - $('hud').offsetHeight; renderer.setSize(innerWidth, innerHeight, false);
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize();
+
+let meta;
+try {
+  meta = await (await fetch('scene.json')).json();
+} catch (e) {
+  $('err').style.display = 'block';
+  $('err').textContent = 'Could not load scene.json. Serve this folder over HTTP: python -m http.server (or run.py --serve).';
+  throw e;
+}
+const LIN = Float32Array.from({ length: 256 }, (_, i) => Math.pow(i / 255, 2.2));  // sRGB -> linear
+const linear = u8 => { const f = new Float32Array(u8.length); for (let i = 0; i < u8.length; i++) f[i] = LIN[u8[i]]; return f; };
+const clip = new THREE.Plane(new THREE.Vector3(0, -1, 0), 100); renderer.localClippingEnabled = true;  // ceiling cut for top-down
+const buf = await (await fetch(meta.cloud)).arrayBuffer(), N = meta.n_points;
+const g = new THREE.BufferGeometry();
+g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(buf, 0, N * 3), 3));
+g.setAttribute('color', new THREE.BufferAttribute(linear(new Uint8Array(buf, N * 12, N * 3)), 3));
+const points = new THREE.Points(g, new THREE.PointsMaterial({ size: 0.03, vertexColors: true, clippingPlanes: [clip] }));
+scene.add(points);
+let meshObj = null;
+if (meta.mesh) {
+  const mb = await (await fetch(meta.mesh.file)).arrayBuffer(), V = meta.mesh.n_verts, F = meta.mesh.n_faces;
+  const mg = new THREE.BufferGeometry();
+  mg.setAttribute('position', new THREE.BufferAttribute(new Float32Array(mb, 0, V * 3), 3));
+  mg.setAttribute('color', new THREE.BufferAttribute(linear(new Uint8Array(mb, V * 12, V * 3)), 3));
+  mg.setIndex(new THREE.BufferAttribute(new Uint32Array(mb, Math.ceil(V * 15 / 4) * 4, F * 3), 1));
+  meshObj = new THREE.Mesh(mg, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, clippingPlanes: [clip] }));
+  scene.add(meshObj); points.visible = false;
+}
+$('surf').value = meshObj ? 'mesh' : 'points'; $('surf').disabled = !meshObj;
+$('surf').onchange = e => { const m = e.target.value === 'mesh'; if (meshObj) meshObj.visible = m; points.visible = !m; };
+
+const { min, max } = meta.bounds, cx = (min[0] + max[0]) / 2, cz = (min[2] + max[2]) / 2;
+const span = Math.max(max[0] - min[0], max[2] - min[2]);
+camera.position.set(cx + span * 0.55, span * 0.75, cz + span * 0.75);
+controls.target.set(cx, 0.8, cz);
+const grid = new THREE.GridHelper(span * 1.2, Math.round(span * 1.2 / 0.5), 0x3a4656, 0x2a3442); grid.position.set(cx, -0.005, cz); scene.add(grid);
+
+function label(text) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 64; const x = c.getContext('2d');
+  x.fillStyle = 'rgba(238,240,242,.92)'; x.fillRect(0, 0, 256, 64);
+  x.fillStyle = '#1c2430'; x.font = '600 30px sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(text, 128, 34);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false }));
+  s.scale.set(0.7, 0.175, 1); return s;
+}
+for (const [name, a] of Object.entries(meta.anchors)) {
+  const s = label(name); s.position.set(a.pos[0], 2.2, a.pos[1]); scene.add(s);
+  const m = new THREE.Mesh(new THREE.RingGeometry(0.2, 0.25, 32).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0xeef0f2 }));
+  m.position.set(a.pos[0], 0.01, a.pos[1]); scene.add(m);
+}
+
+// ---- mannequins built from capsules -------------------------------------------------
+function limb(len, r, mat) { const g = new THREE.Group();
+  const m = new THREE.Mesh(new THREE.CapsuleGeometry(r, Math.max(0.01, len - 2 * r), 4, 10), mat); m.position.y = -len / 2; g.add(m); return g; }
+function makeAvatar(color) {
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.55 });
+  const root = new THREE.Group(), hips = new THREE.Group(), spine = new THREE.Group(), head = new THREE.Group();
+  root.scale.setScalar(0.93); root.add(hips); hips.add(spine); spine.add(head);
+  const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.17, 0.4, 4, 12), mat); torso.position.y = 0.33; spine.add(torso);
+  const hm = new THREE.Mesh(new THREE.SphereGeometry(0.11, 16, 12), mat); hm.position.y = 0.1; head.add(hm); head.position.y = 0.72;
+  const av = { root, hips, spine, head };
+  for (const [s, sx] of [['L', -1], ['R', 1]]) {
+    av['sh' + s] = limb(0.3, 0.05, mat); av['sh' + s].position.set(sx * 0.24, 0.58, 0); spine.add(av['sh' + s]);
+    av['el' + s] = limb(0.28, 0.045, mat); av['el' + s].position.y = -0.3; av['sh' + s].add(av['el' + s]);
+    av['hip' + s] = limb(0.47, 0.075, mat); av['hip' + s].position.set(sx * 0.1, 0, 0); hips.add(av['hip' + s]);
+    av['kn' + s] = limb(0.48, 0.065, mat); av['kn' + s].position.y = -0.47; av['hip' + s].add(av['kn' + s]);
+  }
+  scene.add(root); return av;
+}
+const LIMBS = ['shL', 'shR', 'elL', 'elR', 'hipL', 'hipR', 'knL', 'knR'];
+const reset = av => { av.root.rotation.set(0, 0, 0); av.root.position.y = 0; av.hips.position.y = 0.95;
+  av.spine.rotation.set(0, 0, 0); av.head.rotation.set(0, 0, 0); LIMBS.forEach(k => av[k].rotation.set(0, 0, 0)); };
+const sit = av => { av.hips.position.y = 0.52; av.hipL.rotation.x = av.hipR.rotation.x = -Math.PI / 2;
+  av.knL.rotation.x = av.knR.rotation.x = Math.PI / 2; av.shL.rotation.x = av.shR.rotation.x = -0.5; av.elL.rotation.x = av.elR.rotation.x = -1.0; };
+
+function pose(av, s, u, prev) {
+  reset(av);
+  if (s.kind === 'hidden') { av.root.visible = false; return; }
+  av.root.visible = true;
+  av.root.position.x = lerp(s.from[0], s.to[0], u); av.root.position.z = lerp(s.from[1], s.to[1], u);
+  let yaw = s.yaw;  // ease the turn between consecutive segments
+  if (prev && prev.kind !== 'hidden' && s.kind !== 'sit' && s.kind !== 'collapse') {
+    const w = clamp(u * (s.t1 - s.t0) / 0.3, 0, 1), k = w * w * (3 - 2 * w);
+    let d = s.yaw - prev.yaw; d -= 2 * Math.PI * Math.round(d / (2 * Math.PI)); yaw = prev.yaw + d * k; }
+  av.root.rotation.y = yaw;
+  if (s.kind === 'walk') {
+    const run = s.pace === 'run', A = run ? 0.9 : 0.55;
+    const ph = ((s.dist0 || 0) + u * s.length) * 2 * Math.PI / (run ? 2.2 : 1.4), sn = Math.sin(ph);
+    av.hipL.rotation.x = -A * sn; av.hipR.rotation.x = A * sn;
+    av.knL.rotation.x = (run ? 0.9 : 0.45) * (0.5 + 0.5 * Math.sin(ph + 1.2)); av.knR.rotation.x = (run ? 0.9 : 0.45) * (0.5 + 0.5 * Math.sin(ph + 1.2 + Math.PI));
+    av.shL.rotation.x = (A - 0.05) * sn; av.shR.rotation.x = -(A - 0.05) * sn; av.elL.rotation.x = av.elR.rotation.x = run ? -1.2 : -0.3;
+    av.hips.position.y = 0.95 - 0.015 + 0.02 * Math.abs(Math.cos(ph)); if (run) av.spine.rotation.x = 0.2;
+  } else if (s.kind === 'sit') sit(av);
+  else if (s.kind === 'attack') {
+    const stab = s.style !== 'strike';
+    av.shR.rotation.x = kf(u, stab ? [[0,0],[.35,-2.0],[.55,-1.45],[.72,-1.45],[1,0]] : [[0,0],[.4,-2.9],[.55,-0.7],[.72,-0.7],[1,0]]);
+    av.elR.rotation.x = kf(u, stab ? [[0,0],[.35,-1.9],[.55,-0.1],[.72,-0.1],[1,0]] : [[0,0],[.4,-0.5],[.55,-0.1],[1,0]]);
+    av.spine.rotation.x = kf(u, [[0,0],[.55,.35],[.8,.2],[1,0]]);
+    av.shL.rotation.x = -0.3; av.elL.rotation.x = -0.6;
+  } else if (s.kind === 'collapse') {
+    const e = 1 - Math.pow(1 - u, 3);
+    if (s.from_pose === 'sit') { sit(av); av.spine.rotation.x = 0.9 * e; av.spine.rotation.z = 0.25 * e; av.head.rotation.x = 0.4 * e;
+      av.shL.rotation.x = av.shR.rotation.x = -0.5 + 0.7 * e; av.elL.rotation.x = av.elR.rotation.x = -1.0 + 0.9 * e; }
+    else { av.root.rotation.x = -Math.PI / 2 * e; av.root.position.y = 0.1 * e; }
+  }
+}
+const sample = (tr, t) => { let i = 0; while (i + 1 < tr.length && tr[i + 1].t0 <= t) i++; const s = tr[i];
+  return [s, clamp((t - s.t0) / Math.max(1e-6, s.t1 - s.t0), 0, 1), tr[i - 1]]; };
+
+const plan = meta.plan, D = plan.duration;
+const avatars = {};
+for (const [id, role] of Object.entries(plan.roles)) avatars[id] = makeAvatar(role === 'victim' ? 0x4fa3d9 : 0xe8a33d);
+const ring = new THREE.Mesh(new THREE.RingGeometry(0.12, 0.16, 40), new THREE.MeshBasicMaterial({ color: 0xff4d6d, transparent: true, side: THREE.DoubleSide, depthTest: false }));
+ring.visible = false; scene.add(ring);
+const pathGroup = new THREE.Group(); scene.add(pathGroup);
+for (const [id, lines] of Object.entries(plan.paths || {})) for (const pl of lines) {
+  const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pl.map(p => new THREE.Vector3(p[0], 0.03, p[1]))),
+    new THREE.LineDashedMaterial({ color: plan.roles[id] === 'victim' ? 0x4fa3d9 : 0xe8a33d, dashSize: 0.12, gapSize: 0.08 }));
+  ln.computeLineDistances(); pathGroup.add(ln); }
+$('paths').onchange = e => pathGroup.visible = e.target.checked;
+const saved = { pos: camera.position.clone(), tgt: controls.target.clone() };
+let view = 'orbit'; const perpId = Object.keys(plan.roles).find(k => plan.roles[k] !== 'victim');
+const cams = meta.cameras || [];
+function photoView() { const c = cams[0]; camera.fov = c.fov_y; camera.updateProjectionMatrix();
+  camera.position.set(...c.pos); controls.target.set(c.pos[0] + c.fwd[0] * 3, c.pos[1] + c.fwd[1] * 3, c.pos[2] + c.fwd[2] * 3); }
+$('view').onchange = e => { view = e.target.value; clip.constant = view === 'top' ? 2.0 : 100;
+  if (view !== 'photo') { camera.fov = 55; camera.updateProjectionMatrix(); }
+  if (view === 'photo' && cams.length) photoView();
+  if (view === 'orbit') { camera.position.copy(saved.pos); controls.target.copy(saved.tgt); }
+  if (view === 'top') { camera.position.set(cx, span * 1.5, cz + 0.001); controls.target.set(cx, 0, cz); } };
+
+function update(t) {
+  for (const [id, av] of Object.entries(avatars)) pose(av, ...sample(plan.tracks[id], t));
+  ring.visible = false;
+  for (const im of plan.impacts) { const d = t - im.t;
+    if (d >= 0 && d < 1.4) { ring.visible = true; ring.position.set(...im.pos); ring.scale.setScalar(1 + 2.5 * d / 1.4);
+      ring.material.opacity = 1 - d / 1.4; ring.lookAt(camera.position); } }
+  let cap = ''; for (const c of plan.captions) if (c.t <= t) cap = c.text;
+  $('cap').textContent = cap || '\u00a0';
+  $('scrub').value = (t / D) * 1000; $('time').textContent = `${t.toFixed(1)} / ${D.toFixed(1)} s`;
+}
+
+let t = 0, playing = false, speed = 1, last = performance.now(), recorder = null;
+const setPlay = p => { playing = p; $('play').textContent = p ? 'Pause' : 'Play'; };
+$('play').onclick = () => { if (t >= D) t = 0; setPlay(!playing); };
+$('restart').onclick = () => { t = 0; setPlay(true); };
+$('scrub').oninput = e => { t = (e.target.value / 1000) * D; setPlay(false); };
+$('speed').onchange = e => speed = +e.target.value;
+$('rec').onclick = () => {
+  const chunks = [], r = new MediaRecorder(renderer.domElement.captureStream(30), { mimeType: 'video/webm' });
+  r.ondataavailable = e => chunks.push(e.data);
+  r.onstop = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(chunks, { type: 'video/webm' })); a.download = 'reconstruction.webm'; a.click(); };
+  recorder = r; r.start(); t = 0; setPlay(true);
+};
+if (cams.length) { $('view').value = 'photo'; view = 'photo'; photoView(); } else $('view').remove(0);
+(function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.1); last = now;
+  if (playing) { t += dt * speed;
+    if (t >= D) { t = D; setPlay(false); if (recorder) { recorder.stop(); recorder = null; } } }
+  update(t);
+  if (view === 'follow' && avatars[perpId].root.visible) { const r = avatars[perpId].root, y = r.rotation.y;
+    camera.position.lerp(new THREE.Vector3(r.position.x - Math.sin(y) * 2.2, 1.7, r.position.z - Math.cos(y) * 2.2), 0.12);
+    controls.target.lerp(new THREE.Vector3(r.position.x, 1.2, r.position.z), 0.2); }
+  controls.update(); renderer.render(scene, camera); requestAnimationFrame(frame);
+})(last);
+</script>
+</body>
+</html>

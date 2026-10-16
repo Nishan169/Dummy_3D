@@ -1,0 +1,7 @@
+numpy
+scipy
+opencv-python
+pillow
+torch
+transformers
+anthropic   # optional: better prompt parsing (set ANTHROPIC_API_KEY)
